@@ -1,8 +1,8 @@
-use std::any;
+use std::marker::PhantomData;
 
 use anyhow::Context;
 use async_trait::async_trait;
-use serde::{Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Serialize};
 use url::Url;
 
 use crate::{StorageClient, StorageFormat, StorageObject};
@@ -10,12 +10,16 @@ use tokio::io::AsyncWriteExt;
 
 pub struct FileStorageClient<F: StorageFormat> {
     storage_url: Url,
-    formatter: F,
+    _formatter: PhantomData<F>,
 }
 
-impl<F: StorageFormat> FileStorageClient<F> {
-    pub async fn new(storage_url: Url, formatter: F) -> anyhow::Result<Self> {
-        // Creates the main directory if it does not exist
+#[async_trait]
+impl<F> StorageClient<F> for FileStorageClient<F>
+where 
+    F: StorageFormat + Send + Sync, 
+{
+
+    async fn init(storage_url: Url) -> anyhow::Result<Self> {
         let path = storage_url.path();
         if path.is_empty() {
             return Err(anyhow::anyhow!("Storage URL does not have a valid path"));
@@ -24,35 +28,8 @@ impl<F: StorageFormat> FileStorageClient<F> {
             format!("Failed to create directory at path: {}", path)
         })?;
 
-        Ok(Self {
-            storage_url,
-            formatter,
-        })
+        Ok(Self { storage_url, _formatter: PhantomData::<F> })
     }
-
-
-
-    pub async fn remove_dir(&self) -> anyhow::Result<()> {
-        let path = self.storage_url.path();
-        if path.is_empty() {
-            return Err(anyhow::anyhow!("Storage URL does not have a valid path"));
-        }
-        tokio::fs::remove_dir_all(path).await.with_context(|| {
-            format!("Failed to remove directory at path: {}", path)
-        })?;
-        Ok(())
-    }
-
-    pub fn formatter(&self) -> &F {
-        &self.formatter
-    }
-}
-
-#[async_trait]
-impl<F> StorageClient for FileStorageClient<F>
-where 
-    F: StorageFormat + Send + Sync,
-{
 
     fn directory(&self) -> &str {
         self.storage_url.path()
@@ -70,11 +47,11 @@ where
     // Retrieves the value associated with the key.
     // - Name of object = the subdirectory
     // - key = the file name
-    async fn get<O: StorageObject>(&self, key: &str) -> anyhow::Result<Option<O>> {
+    async fn get<O: StorageObject + DeserializeOwned + Send + Sync>(&self, key: &str) -> anyhow::Result<Option<O>> {
         let file_path = self.object_path::<O>(key);
         match tokio::fs::read(file_path).await {
             Ok(data) => {
-                let obj = self.formatter().deserialize(&data).with_context(|| {
+                let obj = F::deserialize(&data).with_context(|| {
                     format!("Failed to deserialize {} for key: {}", O::type_name(), key)
                 })?;
                 Ok(Some(obj))
@@ -85,14 +62,14 @@ where
         }
     }
 
-    async fn put<O: StorageObject>(&self, key: &str, value: O) -> anyhow::Result<()> {
+    async fn put<O: StorageObject + Serialize + Send + Sync>(&self, key: &str, value: O) -> anyhow::Result<()> {
         let file_path = self.object_path::<O>(key);
         let mut file = match tokio::fs::File::create(&file_path).await {
             Ok(file) => file,
             Err(e) => return Err(e.into()),
         };
 
-        let data = self.formatter().serialize(&value).with_context(|| {
+        let data = F::serialize(&value).with_context(|| {
             format!("Failed to serialize object for key: {}", key)
         })?;
 
@@ -145,9 +122,10 @@ where
 mod tests {
 
 
-    use crate::json::JsonStorageFormat;
+    use crate::{json::JsonStorageFormat, RustStandardType, StorageSchema};
 
     use super::*;
+    use ordermap::OrderMap;
     use serde::{Deserialize, Serialize};
 
     #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -156,30 +134,31 @@ mod tests {
         value: String,
     }
 
-    #[derive(Serialize, Deserialize, Debug, Clone)]
-    struct TestStorageKey {
-        name: String,
-        value: String,
-    }
-
 
     impl StorageObject for TestObject {
-        fn key(&self) -> &str {
-            &self.key
-        }
 
         fn type_name() -> &'static str {
             "TestObject"
         }
-    }
 
+        fn schema() -> StorageSchema {
+            let mut schema = OrderMap::new();
+            schema.insert("key".to_string(), RustStandardType::String);
+            schema.insert("value".to_string(), RustStandardType::String);
+            StorageSchema::Standard {
+                schema: schema,
+                primary_key: "key".to_string(),
+            } 
+        }
+
+    }
 
     #[tokio::test]
     async fn test_file_storage_client_json() {
         let current_directory = std::env::current_dir().expect("Failed to get current directory"); 
         let test_directory = current_directory.join("test_dir");
         let url = Url::from_directory_path(test_directory).expect("Failed to create URL from directory path");
-        let file_storage_client = FileStorageClient::<JsonStorageFormat>::new(url, JsonStorageFormat).await;
+        let file_storage_client = FileStorageClient::<JsonStorageFormat>::init(url).await;
         assert!(file_storage_client.is_ok());
 
         let file_storage_client = file_storage_client.unwrap();
